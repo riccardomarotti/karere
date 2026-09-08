@@ -5,6 +5,11 @@ All notable changes to Karere will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Custom Web CSS**: optionally load `$XDG_CONFIG_HOME/karere/custom.css` into WhatsApp Web. The stylesheet is monitored and reapplied live across all isolated account browsers, including atomic file replacements.
+
 ## [4.2.5] - 2026-08-23
 
 ### Fixed

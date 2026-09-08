@@ -100,6 +100,7 @@ For the full release history, see [CHANGELOG.md](CHANGELOG.md).
 - **Granular Notification Controls**: Master toggle, plus individual settings for sound on/off, previews, and downloads
 - **Privacy Settings**: Control message previews and system tray behavior
 - **Theme Selection**: Light, Dark, or System preference
+- **Custom Web CSS**: Optionally load `$XDG_CONFIG_HOME/karere/custom.css` into WhatsApp Web
 - **Permission Management**: Persistent controls for Microphone and Notifications
 - **Startup Control**: Toggle automatic launch on login
 
@@ -140,6 +141,15 @@ Access preferences through the application menu or keyboard shortcut (`Ctrl+,`) 
 - **Accessibility**: Keyboard shortcuts, focus indicators, high contrast, reduced motion, zoom settings, screen reader optimization
 - **Notifications**: Native notification preferences, preview settings, background notifications
 - **Spell Checking**: Multi-language spell checking with auto-detect
+
+### Custom Web CSS
+
+Karere optionally loads `$XDG_CONFIG_HOME/karere/custom.css` into WhatsApp Web. The file is
+watched while Karere is running, so saving a new stylesheet updates every isolated account
+without restarting the application. If `XDG_CONFIG_HOME` is unset, the native default is
+`~/.config`; sandboxed installations such as Flatpak resolve it inside the application's
+sandbox-specific config directory instead. The feature is generic and can be used with any
+CSS generator or editor.
 
 ### Keyboard Shortcuts
 

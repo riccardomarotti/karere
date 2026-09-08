@@ -1,5 +1,35 @@
-use gtk::glib;
 use gtk::subclass::prelude::*;
+use gtk::{gio, glib};
+
+/// Whether a directory-monitor event concerns the generated custom stylesheet.
+/// Both paths matter for atomic renames, where `other_file` may be the target.
+fn custom_css_event_is_relevant(
+    file: &gio::File,
+    other_file: Option<&gio::File>,
+    file_name: &str,
+    event: gio::FileMonitorEvent,
+) -> bool {
+    use gio::prelude::FileExt;
+
+    let content_event = matches!(
+        event,
+        gio::FileMonitorEvent::Changed
+            | gio::FileMonitorEvent::ChangesDoneHint
+            | gio::FileMonitorEvent::Deleted
+            | gio::FileMonitorEvent::Created
+            | gio::FileMonitorEvent::AttributeChanged
+            | gio::FileMonitorEvent::Moved
+            | gio::FileMonitorEvent::Renamed
+            | gio::FileMonitorEvent::MovedIn
+            | gio::FileMonitorEvent::MovedOut
+    );
+    content_event
+        && std::iter::once(file).chain(other_file).any(|candidate| {
+            candidate
+                .basename()
+                .is_some_and(|name| name.to_string_lossy() == file_name)
+        })
+}
 
 glib::wrapper! {
     pub struct KarereWebView(ObjectSubclass<imp::KarereWebView>)
@@ -106,6 +136,12 @@ impl KarereWebView {
         for h in &hosts {
             crate::cdp::apply_color_scheme(h);
         }
+    }
+
+    /// Reinject the current user stylesheet into every live account browser.
+    /// Called by the custom CSS file monitor after a debounced file change.
+    pub fn reapply_custom_css(&self) {
+        self.imp().reapply_custom_css();
     }
 
     pub fn shared(&self) -> crate::handlers::SharedRef {
@@ -528,9 +564,9 @@ mod imp {
     };
     use gl::types::{GLenum, GLint, GLuint};
     use glib::subclass::Signal;
-    use gtk::glib;
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
+    use gtk::{gio, glib};
     use once_cell::sync::Lazy;
     use parking_lot::Mutex;
     use std::cell::RefCell;
@@ -556,6 +592,11 @@ mod imp {
         /// Per-account in-process CDP notification-bridge registrations. Held
         /// alive for the browser's lifetime; dropping one detaches the observer.
         pub cdp_registrations: RefCell<HashMap<String, cef::Registration>>,
+        /// Directory monitor for the optional user stylesheet. Watching the
+        /// directory handles atomic replacement by template generators.
+        pub custom_css_monitor: RefCell<Option<gio::FileMonitor>>,
+        /// Debounced custom CSS refresh source, if a file event is pending.
+        pub custom_css_reload: RefCell<Option<glib::SourceId>>,
         /// RequestContexts kept alive until the browser is created against them
         /// (in their init callback). Keyed by account id.
         pub pending_contexts: Mutex<HashMap<String, RequestContext>>,
@@ -758,6 +799,9 @@ mod imp {
             unsafe {
                 self.init_gl();
             }
+            if !self.devtools.load(Ordering::Relaxed) {
+                self.start_custom_css_monitor();
+            }
             self.bootstrap_pool();
 
             // Follow scale changes (e.g. dragging between monitors of different
@@ -880,6 +924,9 @@ mod imp {
         }
 
         pub fn close_browser(&self) {
+            if let Some(source) = self.custom_css_reload.borrow_mut().take() {
+                source.remove();
+            }
             #[cfg(test)]
             if self.suppress_browser_creation.load(Ordering::Acquire) {
                 self.fallback_test_events.borrow_mut().push(("close", None));
@@ -917,6 +964,118 @@ mod imp {
             }
             *self.browser.lock() = None;
             *self.life_span.lock() = None;
+        }
+
+        /// Start watching the configuration directory for generated CSS updates.
+        /// The directory, rather than only the file, is monitored because a
+        /// generator may write a temporary file and atomically rename it into place.
+        fn start_custom_css_monitor(&self) {
+            use gio::prelude::{FileExt, FileMonitorExt};
+
+            if self.custom_css_monitor.borrow().is_some() {
+                return;
+            }
+            let css_path = crate::cdp::custom_css_path();
+            let Some(directory) = css_path.parent() else {
+                log::warn!("custom CSS path has no parent: {}", css_path.display());
+                return;
+            };
+            if let Err(e) = std::fs::create_dir_all(directory) {
+                log::warn!(
+                    "failed to create custom CSS directory {}: {e}",
+                    directory.display()
+                );
+                return;
+            }
+            let Some(file_name) = css_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+            else {
+                log::warn!(
+                    "custom CSS path has no valid file name: {}",
+                    css_path.display()
+                );
+                return;
+            };
+
+            let directory_file = gio::File::for_path(directory);
+            let monitor = match directory_file
+                .monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
+            {
+                Ok(monitor) => monitor,
+                Err(e) => {
+                    log::warn!(
+                        "failed to monitor custom CSS directory {}: {e}",
+                        directory.display()
+                    );
+                    return;
+                }
+            };
+            let weak = self.obj().downgrade();
+            let watched_name = file_name.clone();
+            monitor.connect_changed(move |_monitor, file, other_file, event| {
+                if !super::custom_css_event_is_relevant(file, other_file, &watched_name, event) {
+                    return;
+                }
+                let Some(widget) = weak.upgrade() else {
+                    return;
+                };
+                widget.imp().schedule_custom_css_reload();
+            });
+            *self.custom_css_monitor.borrow_mut() = Some(monitor);
+            log::info!("watching custom CSS file {}", css_path.display());
+        }
+
+        /// Schedule one stylesheet refresh for a burst of filesystem events.
+        fn schedule_custom_css_reload(&self) {
+            if let Some(source) = self.custom_css_reload.borrow_mut().take() {
+                source.remove();
+            }
+            let weak = self.obj().downgrade();
+            let source =
+                glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
+                    let Some(widget) = weak.upgrade() else {
+                        return;
+                    };
+                    let imp = widget.imp();
+                    imp.custom_css_reload.borrow_mut().take();
+                    imp.reapply_custom_css();
+                });
+            *self.custom_css_reload.borrow_mut() = Some(source);
+        }
+
+        /// Reinject the current stylesheet into all account browsers. Clone the
+        /// browser handles first so CDP sends never happen while a pool lock is held.
+        pub fn reapply_custom_css(&self) {
+            let (script, css_len) = match crate::cdp::load_custom_css_script() {
+                Ok(payload) => payload,
+                Err(e) => {
+                    log::warn!("failed to read custom CSS after change: {e}");
+                    return;
+                }
+            };
+            let browsers: Vec<Browser> = {
+                let pooled = self.browsers.lock();
+                if pooled.is_empty() {
+                    self.browser.lock().clone().into_iter().collect()
+                } else {
+                    pooled.values().cloned().collect()
+                }
+            };
+            if browsers.is_empty() {
+                log::debug!("custom CSS changed with no live browsers");
+                return;
+            }
+            log::info!(
+                "custom CSS changed; reinjecting into {} browser(s)",
+                browsers.len()
+            );
+            for browser in browsers {
+                if let Some(host) = browser.host() {
+                    crate::cdp::apply_custom_css_script(&host, &script, css_len);
+                }
+            }
         }
 
         /// Recreate this widget's browser pool with CEF shared textures disabled.
@@ -4198,5 +4357,48 @@ mod zoom_tests {
     fn clamp_above_max() {
         let back = cef_to_linear(linear_to_cef(5.0));
         assert!((back - ZOOM_MAX).abs() < 1e-9, "clamp 5.0 -> {back}");
+    }
+}
+
+#[cfg(test)]
+mod custom_css_monitor_tests {
+    use super::custom_css_event_is_relevant;
+    use gtk::gio;
+
+    #[test]
+    fn matches_target_and_atomic_replace_events() {
+        let target = gio::File::for_path("/tmp/custom.css");
+        let temporary = gio::File::for_path("/tmp/.custom.css.tmp");
+
+        assert!(custom_css_event_is_relevant(
+            &target,
+            None,
+            "custom.css",
+            gio::FileMonitorEvent::Changed,
+        ));
+        assert!(custom_css_event_is_relevant(
+            &target,
+            None,
+            "custom.css",
+            gio::FileMonitorEvent::MovedIn,
+        ));
+        assert!(custom_css_event_is_relevant(
+            &temporary,
+            Some(&target),
+            "custom.css",
+            gio::FileMonitorEvent::Moved,
+        ));
+        assert!(!custom_css_event_is_relevant(
+            &temporary,
+            None,
+            "custom.css",
+            gio::FileMonitorEvent::Changed,
+        ));
+        assert!(!custom_css_event_is_relevant(
+            &target,
+            None,
+            "custom.css",
+            gio::FileMonitorEvent::PreUnmount,
+        ));
     }
 }

@@ -12,6 +12,8 @@
 
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -45,8 +47,7 @@ pub fn set_dark_preference(dark: bool) {
 /// [`PREFERS_DARK`]. Sent on attach/load and on live theme changes. (#160)
 pub fn apply_color_scheme(host: &BrowserHost) {
     // Out-of-band id range so it can't collide with a session's bumped ids.
-    static CTR: AtomicU32 = AtomicU32::new(2_000_000);
-    let id = CTR.fetch_add(1, Ordering::Relaxed);
+    let id = next_out_of_band_id();
     let scheme = if PREFERS_DARK.load(Ordering::Relaxed) {
         "dark"
     } else {
@@ -222,6 +223,90 @@ const PAGE_PATCH: &str = r#"
 })();
 "#;
 
+const CUSTOM_CSS_STYLE_ID: &str = "karere-custom-css";
+
+/// Return the optional user stylesheet path. The path follows the XDG config
+/// directory, as resolved by GLib, so `$XDG_CONFIG_HOME` is honored.
+pub fn custom_css_path() -> PathBuf {
+    glib::user_config_dir().join("karere").join("custom.css")
+}
+
+/// Build the page expression that creates or updates Karere's stylesheet.
+/// `css` is encoded as a JSON string so arbitrary CSS cannot alter the JS
+/// expression being evaluated by CDP.
+fn custom_css_script(css: Option<&str>) -> String {
+    let style_id = json_string(CUSTOM_CSS_STYLE_ID);
+    match css {
+        Some(css) => format!(
+            "(function(){{\
+                var style=document.getElementById({style_id});\
+                if(!style){{\
+                    style=document.createElement('style');\
+                    style.id={style_id};\
+                    var parent=document.head||document.documentElement;\
+                    if(!parent)return;\
+                    parent.appendChild(style);\
+                }}\
+                style.textContent={};\
+            }})();",
+            json_string(css)
+        ),
+        None => format!(
+            "(function(){{\
+                var style=document.getElementById({style_id});\
+                if(style)style.remove();\
+            }})();"
+        ),
+    }
+}
+
+/// Read the optional user stylesheet. A missing file is a valid disabled state;
+/// other I/O errors leave the currently injected stylesheet unchanged.
+fn read_custom_css() -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(custom_css_path()) {
+        Ok(css) => Ok(Some(css)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Load and serialize the optional stylesheet once for reuse across browsers.
+pub(crate) fn load_custom_css_script() -> std::io::Result<(String, usize)> {
+    let css = read_custom_css()?;
+    let css_len = css.as_deref().map_or(0, str::len);
+    Ok((custom_css_script(css.as_deref()), css_len))
+}
+
+/// Inject a previously loaded stylesheet script in the page's main realm.
+pub(crate) fn apply_custom_css_script(host: &BrowserHost, script: &str, css_len: usize) {
+    log::debug!("cdp: applying custom CSS ({} bytes)", css_len);
+    let id = next_out_of_band_id();
+    send(
+        host,
+        &json_msg(id, "Runtime.evaluate", &eval_params(script)),
+    );
+}
+
+/// Inject or remove the optional user stylesheet in the page's main realm.
+/// This is intentionally generic: any CSS generator can produce the same
+/// `$XDG_CONFIG_HOME/karere/custom.css` file.
+pub fn apply_custom_css(host: &BrowserHost) {
+    let (script, css_len) = match load_custom_css_script() {
+        Ok(payload) => payload,
+        Err(e) => {
+            log::warn!("cdp: failed to read custom CSS: {e}");
+            return;
+        }
+    };
+    apply_custom_css_script(host, &script, css_len);
+}
+
+/// Out-of-band IDs avoid collisions with the per-browser observer state.
+fn next_out_of_band_id() -> u32 {
+    static CTR: AtomicU32 = AtomicU32::new(2_000_000);
+    CTR.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Per-browser CDP state. Lives on the CEF UI thread (single-threaded), so a
 /// plain `RefCell` suffices — no locking.
 struct State {
@@ -324,6 +409,9 @@ fn arm(host: &BrowserHost, state: &Rc<RefCell<State>>) {
         host,
         &json_msg(id, "Runtime.evaluate", &eval_params(PAGE_PATCH)),
     );
+    // Inject optional user CSS after the existing page patch. This is also
+    // reapplied for each new execution context below (page reloads).
+    apply_custom_css(host);
     // Match the web content's color scheme to the Karere theme (#160).
     apply_color_scheme(host);
     // Read the current WhatsApp locale; `handle` reconciles it against the
@@ -393,6 +481,9 @@ fn handle(state: &Rc<RefCell<State>>, host: &BrowserHost, v: &serde_json::Value)
     // Page finished loading (page realm only) — now the rendered language is
     // set, so re-probe and reconcile against the override.
     if method == "Page.loadEventFired" && session.is_none() {
+        // The execution context may have appeared before document.head was
+        // available; this late pass guarantees the stylesheet has a DOM target.
+        apply_custom_css(host);
         send_lang_probe(host, state);
         return;
     }
@@ -433,6 +524,9 @@ fn handle(state: &Rc<RefCell<State>>, host: &BrowserHost, v: &serde_json::Value)
                     host,
                     &json_msg(id, "Runtime.evaluate", &eval_params(PAGE_PATCH)),
                 );
+                // The new page realm lost the stylesheet along with the page
+                // patch, so apply the current file contents again.
+                apply_custom_css(host);
             }
             Some(s) if state.borrow().sw_sessions.contains(s) => {
                 let s = s.to_owned();
@@ -611,4 +705,31 @@ fn json_msg_sess(id: u32, method: &str, params: &str, session: &str) -> String {
 
 fn json_string(s: &str) -> String {
     serde_json::Value::String(s.to_owned()).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CUSTOM_CSS_STYLE_ID, custom_css_script};
+
+    #[test]
+    fn custom_css_script_updates_a_dedicated_style_element() {
+        let css = "body { content: `literal`; }\\n:root { --value: \"quoted\"; } ${not_js}";
+        let script = custom_css_script(Some(css));
+        let encoded_css = serde_json::to_string(css).unwrap();
+
+        assert!(script.contains("document.createElement('style')"));
+        assert!(script.contains(&format!(
+            "document.getElementById(\"{CUSTOM_CSS_STYLE_ID}\")"
+        )));
+        assert!(script.contains(&format!("style.textContent={encoded_css}")));
+        assert!(script.contains("document.head||document.documentElement"));
+    }
+
+    #[test]
+    fn custom_css_script_removes_the_style_element_when_disabled() {
+        let script = custom_css_script(None);
+
+        assert!(script.contains("if(style)style.remove()"));
+        assert!(!script.contains("style.textContent"));
+    }
 }
