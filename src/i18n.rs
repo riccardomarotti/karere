@@ -71,7 +71,7 @@ pub fn ui_locales() -> Vec<(String, String)> {
 pub fn override_locale() -> Option<String> {
     // CEF zygotes must remain single-threaded before forking. Reading the
     // GSettings below can start GLib/GIO worker threads in subprocesses.
-    if std::env::args().any(|arg| arg.starts_with("--type=")) {
+    if std::env::args_os().any(|arg| arg.to_string_lossy().starts_with("--type=")) {
         return None;
     }
 
