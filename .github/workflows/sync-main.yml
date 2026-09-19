@@ -1,0 +1,66 @@
+name: Sync main with upstream
+
+on:
+  schedule:
+    - cron: '30 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-main-with-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Rebase fork main onto upstream/main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Require sync token
+        env:
+          MAIN_SYNC_TOKEN: ${{ secrets.MAIN_SYNC_TOKEN }}
+        run: |
+          if [[ -z "$MAIN_SYNC_TOKEN" ]]; then
+            echo '::error title=Missing MAIN_SYNC_TOKEN::Create a repository secret named MAIN_SYNC_TOKEN with Contents: read/write and Workflows: read/write access to this repository.'
+            exit 1
+          fi
+
+      - name: Check out fork main
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.MAIN_SYNC_TOKEN }}
+
+      - name: Rebase main onto upstream/main
+        run: |
+          set -Eeuo pipefail
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git remote add upstream https://github.com/tobagin/karere.git
+          git fetch origin main
+          git fetch upstream main:refs/remotes/upstream/main
+
+          # Always start from the exact remote main that this run observed.
+          # The explicit lease used for the push below protects against another
+          # writer changing main while the rebase is running.
+          expected_remote_sha="$(git rev-parse refs/remotes/origin/main)"
+          git reset --hard "$expected_remote_sha"
+
+          if git merge-base --is-ancestor refs/remotes/upstream/main HEAD; then
+            echo 'main already contains upstream/main; nothing to do.'
+            exit 0
+          fi
+
+          git rebase refs/remotes/upstream/main
+
+          git push \
+            --force-with-lease=refs/heads/main:"$expected_remote_sha" \
+            origin HEAD:refs/heads/main
+
+          echo 'main rebased onto upstream/main.'

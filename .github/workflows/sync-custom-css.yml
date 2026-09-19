@@ -1,0 +1,942 @@
+name: Sync custom CSS branch and AUR release
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Optional stable upstream application tag (for example v4.2.5)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: custom-css-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: tobagin/karere
+  DOWNSTREAM_BRANCH: custom-css
+  CSS_COMMIT: d41944058435d6d9975028e4092c632326f66a91
+  CSS_SOURCE_TAG: custom-css-patch-v1
+  AUR_PACKAGE: karere-custom-css
+  AUR_REPOSITORY: ssh://aur@aur.archlinux.org/karere-custom-css.git
+
+jobs:
+  sync:
+    name: Sync downstream branch and stable AUR package
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Prepare candidate and inspect fork state
+        id: candidate
+        env:
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -Eeuo pipefail
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          # Refresh all upstream tags. The selection below accepts only stable
+          # application tags and therefore ignores cef-* and prereleases.
+          git fetch --force --tags upstream '+refs/tags/*:refs/tags/*'
+          git fetch origin \
+            "refs/tags/${CSS_SOURCE_TAG}:refs/tags/${CSS_SOURCE_TAG}"
+          css_source_sha="$(git rev-parse "${CSS_SOURCE_TAG}^{commit}")"
+          if [[ "$css_source_sha" != "$CSS_COMMIT" ]]; then
+            echo "CSS source tag ${CSS_SOURCE_TAG} points to ${css_source_sha}, expected ${CSS_COMMIT}." >&2
+            exit 1
+          fi
+          current_sha="$(git ls-remote origin "refs/heads/${DOWNSTREAM_BRANCH}" | awk '{print $1}')"
+          if [[ -n "$current_sha" ]]; then
+            git fetch origin \
+              "refs/heads/${DOWNSTREAM_BRANCH}:refs/remotes/origin/${DOWNSTREAM_BRANCH}"
+          fi
+
+          latest_tag=''
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            if [[ ! "$REQUESTED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Requested tag is not a stable application tag: $REQUESTED_TAG" >&2
+              exit 1
+            fi
+            latest_tag="$REQUESTED_TAG"
+          else
+            while IFS= read -r tag; do
+              if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                latest_tag="$tag"
+                break
+              fi
+            done < <(git tag --list 'v[0-9]*' --sort=-version:refname)
+          fi
+
+          if [[ -z "$latest_tag" ]]; then
+            echo 'No stable upstream application tag was found.' >&2
+            exit 1
+          fi
+          git rev-parse --verify --quiet "${latest_tag}^{commit}" >/dev/null
+
+          upstream_sha="$(git rev-parse "${latest_tag}^{commit}")"
+          local_tag_object="$(git rev-parse "refs/tags/${latest_tag}")"
+          remote_tag_object="$(git ls-remote origin "refs/tags/${latest_tag}" | awk '{print $1}')"
+          tag_needs_update=false
+          if [[ -z "$remote_tag_object" ]]; then
+            tag_needs_update=true
+          elif [[ "$remote_tag_object" != "$local_tag_object" ]]; then
+            echo "Fork tag ${latest_tag} exists but points to a different tag object." >&2
+            echo "Expected: ${local_tag_object}" >&2
+            echo "Remote:   ${remote_tag_object}" >&2
+            exit 1
+          fi
+
+          git cat-file -e "${CSS_COMMIT}^{commit}"
+          git switch --detach "$latest_tag"
+          git switch -c custom-css-candidate
+
+          # Keep release-facing documentation identical to upstream. The CSS
+          # commit contains README.md and CHANGELOG.md notes for the fork, but
+          # those belong in the fork documentation, not in the mirrored branch.
+          if ! git cherry-pick --no-commit "$CSS_COMMIT"; then
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+            if (( ${#conflicts[@]} == 0 )); then
+              git reset --hard HEAD
+              echo "CSS patch failed to apply to upstream ${latest_tag}." >&2
+              exit 1
+            fi
+            for path in "${conflicts[@]}"; do
+              case "$path" in
+                README.md|CHANGELOG.md) ;;
+                *)
+                  git reset --hard HEAD
+                  echo "CSS patch conflicts with upstream ${latest_tag} in unexpected file: ${path}" >&2
+                  exit 1
+                  ;;
+              esac
+            done
+          fi
+          git restore --source=HEAD --staged --worktree -- README.md CHANGELOG.md
+          git diff --cached --check
+          git commit -C "$CSS_COMMIT"
+
+          candidate_sha="$(git rev-parse HEAD)"
+          branch_needs_update=true
+          published_downstream_sha="$candidate_sha"
+          if [[ -n "$current_sha" ]] && git diff --quiet \
+            "refs/remotes/origin/${DOWNSTREAM_BRANCH}^{tree}" \
+            'HEAD^{tree}'; then
+            branch_needs_update=false
+            # Never pin AUR to a newly recreated temporary commit when the
+            # published branch tree is already current.
+            published_downstream_sha="$current_sha"
+          fi
+
+          pkgver="${latest_tag#v}"
+          {
+            echo "latest_tag=$latest_tag"
+            echo "upstream_sha=$upstream_sha"
+            echo "candidate_sha=$candidate_sha"
+            echo "published_downstream_sha=$published_downstream_sha"
+            echo "current_downstream_sha=$current_sha"
+            echo "branch_needs_update=$branch_needs_update"
+            echo "tag_needs_update=$tag_needs_update"
+            echo "pkgver=$pkgver"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Using upstream ${latest_tag} (${upstream_sha})."
+          echo "Candidate ${candidate_sha}."
+          echo "Published downstream SHA ${published_downstream_sha}."
+          echo "branch_needs_update=${branch_needs_update}."
+          echo "tag_needs_update=${tag_needs_update}."
+
+      - name: Derive and cross-check CEF metadata from candidate
+        id: cef_metadata
+        run: |
+          set -Eeuo pipefail
+
+          cef_default="$(sed -n 's/^CEF_VERSION="${CEF_VERSION:-\([^"]*\)}"$/\1/p' download-cef.sh)"
+          if [[ -z "$cef_default" ]]; then
+            echo 'Could not find the default CEF_VERSION in download-cef.sh.' >&2
+            exit 1
+          fi
+
+          if [[ ! "$cef_default" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\+(g[0-9a-fA-F]+)\+chromium-([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "Unexpected CEF_VERSION format: $cef_default" >&2
+            exit 1
+          fi
+
+          cef_ver="${BASH_REMATCH[1]}"
+          cef_hash="${BASH_REMATCH[2]}"
+          cef_chromium="${BASH_REMATCH[3]}"
+          cef_release_tag="cef-${cef_ver}-proprietary-codecs"
+          cef_asset_name="cef_binary_${cef_ver}+${cef_hash}+chromium-${cef_chromium}_linux64_minimal.zip"
+
+          # The Flatpak manifest is parsed below with Python's standard library;
+          # no external YAML dependency is required on the runner.
+          mapfile -t manifest_values < <(python3 - "packaging/io.github.tobagin.karere.yml" "$UPSTREAM_REPOSITORY" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+          from urllib.parse import unquote
+
+          manifest_path = Path(sys.argv[1])
+          repository = sys.argv[2]
+          text = manifest_path.read_text()
+
+          modules = re.findall(
+              r"(?ms)^  - name: cef-binaries[ \t]*\n(?P<body>.*?)(?=^  - name:|\Z)",
+              text,
+          )
+          if len(modules) != 1:
+              raise SystemExit(f"expected exactly one cef-binaries module, found {len(modules)}")
+
+          archives = re.findall(
+              r"(?ms)^      - type: archive[ \t]*\n(?P<body>.*?)(?=^      - type:|\Z)",
+              modules[0],
+          )
+          x86_archives = []
+          for block in archives:
+              arches_match = re.search(r"(?m)^\s+only-arches:\s*\[([^]]+)\]\s*$", block)
+              if not arches_match:
+                  raise SystemExit("CEF archive is missing only-arches")
+              arches = [item.strip() for item in arches_match.group(1).split(",") if item.strip()]
+              if arches != ["x86_64"]:
+                  continue
+              url_match = re.search(r"(?m)^\s+url:\s*(\S+)\s*$", block)
+              sha_match = re.search(r"(?m)^\s+sha256:\s*([0-9a-fA-F]{64})\s*$", block)
+              if not url_match or not sha_match:
+                  raise SystemExit("x86_64 CEF archive is missing url or sha256")
+              x86_archives.append((unquote(url_match.group(1)), sha_match.group(1).lower()))
+
+          if len(x86_archives) != 1:
+              raise SystemExit(f"expected exactly one x86_64 CEF archive, found {len(x86_archives)}")
+
+          url, sha256 = x86_archives[0]
+          version_pattern = r"[0-9]+\.[0-9]+\.[0-9]+"
+          chromium_pattern = r"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"
+          url_pattern = (
+              rf"^https://github\.com/{re.escape(repository)}/releases/download/"
+              rf"cef-(?P<tag_ver>{version_pattern})-proprietary-codecs/"
+              rf"cef_binary_(?P<asset_ver>{version_pattern})\+(?P<cef_hash>g[0-9a-fA-F]+)"
+              rf"\+chromium-(?P<chromium>{chromium_pattern})_linux64_minimal\.zip$"
+          )
+          url_match = re.match(url_pattern, url)
+          if not url_match:
+              raise SystemExit(f"unexpected x86_64 CEF archive URL: {url}")
+          if url_match.group("tag_ver") != url_match.group("asset_ver"):
+              raise SystemExit("CEF release tag and asset versions differ in Flatpak manifest")
+
+          print(url_match.group("asset_ver"))
+          print(url_match.group("cef_hash"))
+          print(url_match.group("chromium"))
+          print(sha256)
+          PY
+          )
+          if (( ${#manifest_values[@]} != 4 )); then
+            echo 'Flatpak CEF metadata parser returned an unexpected number of values.' >&2
+            exit 1
+          fi
+          manifest_cef_ver="${manifest_values[0]}"
+          manifest_cef_hash="${manifest_values[1]}"
+          manifest_cef_chromium="${manifest_values[2]}"
+          manifest_sha256="${manifest_values[3]}"
+
+          if [[ "$cef_ver" != "$manifest_cef_ver" || "$cef_hash" != "$manifest_cef_hash" || "$cef_chromium" != "$manifest_cef_chromium" ]]; then
+            echo '::error title=CEF metadata mismatch::download-cef.sh and Flatpak manifest disagree.' >&2
+            printf 'download-cef.sh:\n  CEF version:      %s\n  CEF hash:         %s\n  Chromium version: %s\n' \
+              "$cef_ver" "$cef_hash" "$cef_chromium" >&2
+            printf 'Flatpak manifest:\n  CEF version:      %s\n  CEF hash:         %s\n  Chromium version: %s\n' \
+              "$manifest_cef_ver" "$manifest_cef_hash" "$manifest_cef_chromium" >&2
+            exit 1
+          fi
+
+          {
+            echo "cef_ver=$cef_ver"
+            echo "cef_hash=$cef_hash"
+            echo "cef_chromium=$cef_chromium"
+            echo "cef_release_tag=$cef_release_tag"
+            echo "cef_asset_name=$cef_asset_name"
+            echo "cef_manifest_ver=$manifest_cef_ver"
+            echo "cef_manifest_hash=$manifest_cef_hash"
+            echo "cef_manifest_chromium=$manifest_cef_chromium"
+            echo "cef_manifest_sha256=$manifest_sha256"
+            echo 'cef_metadata_verified=true'
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Required CEF: ${cef_ver}+${cef_hash}+chromium-${cef_chromium}."
+          echo "Required CEF asset: ${cef_asset_name}."
+          echo "Verified against Flatpak manifest SHA256: ${manifest_sha256}."
+
+      - name: Configure AUR SSH
+        id: aur_ssh
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "$AUR_SSH_PRIVATE_KEY" ]]; then
+            echo 'AUR_SSH_PRIVATE_KEY is not configured.' >&2
+            exit 1
+          fi
+
+          key_path="$RUNNER_TEMP/aur_key"
+          ssh_dir="$RUNNER_TEMP/aur_ssh"
+          mkdir -p "$ssh_dir"
+          umask 077
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$key_path"
+          chmod 600 "$key_path"
+
+          known_hosts="$ssh_dir/known_hosts"
+          scanned_key="$(ssh-keyscan -t ed25519 aur.archlinux.org 2>/dev/null)"
+          if [[ -z "$scanned_key" ]]; then
+            echo 'Could not obtain the AUR SSH host key.' >&2
+            exit 1
+          fi
+          fingerprint="$(printf '%s\n' "$scanned_key" | ssh-keygen -lf - -E sha256 | awk 'NR == 1 {print $2}')"
+          if [[ "$fingerprint" != 'SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4' ]]; then
+            echo "Unexpected AUR SSH host-key fingerprint: $fingerprint" >&2
+            exit 1
+          fi
+          printf '%s\n' "$scanned_key" > "$known_hosts"
+
+          {
+            echo "AUR_SSH_KEY=$key_path"
+            echo "AUR_SSH_KNOWN_HOSTS=$known_hosts"
+            echo "GIT_SSH_COMMAND=ssh -i $key_path -o UserKnownHostsFile=$known_hosts -o IdentitiesOnly=yes"
+          } >> "$GITHUB_ENV"
+          echo "aur_dir=$RUNNER_TEMP/aur-package" >> "$GITHUB_OUTPUT"
+
+      - name: Inspect current AUR package state
+        id: aur_state
+        env:
+          AUR_DIR: ${{ steps.aur_ssh.outputs.aur_dir }}
+        run: |
+          set -Eeuo pipefail
+
+          rm -rf "$AUR_DIR"
+          if ! git clone "$AUR_REPOSITORY" "$AUR_DIR"; then
+            echo '::error title=AUR SSH authentication failed::Check that AUR_SSH_PRIVATE_KEY contains the unencrypted private key whose public counterpart is registered in the AUR account.'
+            exit 1
+          fi
+          test -f "$AUR_DIR/PKGBUILD"
+          test -f "$AUR_DIR/.SRCINFO"
+
+          python3 - "$AUR_DIR/PKGBUILD" "$AUR_DIR/.SRCINFO" "$GITHUB_OUTPUT" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          pkgb_path, srcinfo_path, output_path = map(Path, sys.argv[1:])
+          pkgb = pkgb_path.read_text()
+          srcinfo = srcinfo_path.read_text()
+
+          def assignment(name: str) -> str:
+              matches = re.findall(rf'^{re.escape(name)}=(?:"([^"]*)"|\'([^\']*)\'|([^\s#]+))$', pkgb, re.MULTILINE)
+              values = []
+              for match in matches:
+                  nonempty = [value for value in match if value]
+                  if len(nonempty) != 1:
+                      raise SystemExit(f'could not parse {name}= assignment')
+                  values.append(nonempty[0])
+              if len(values) != 1:
+                  raise SystemExit(f'expected exactly one {name}= assignment, found {len(values)}')
+              return values[0]
+
+          def srcinfo_assignment(name: str) -> str:
+              matches = re.findall(rf'^\s*{re.escape(name)} = (.+)$', srcinfo, re.MULTILINE)
+              if len(matches) != 1:
+                  raise SystemExit(f'expected exactly one .SRCINFO {name} assignment, found {len(matches)}')
+              return matches[0].strip()
+
+          checksum_block = re.search(r'^sha256sums=\(\n(.*?)^\)', pkgb, re.MULTILINE | re.DOTALL)
+          if not checksum_block:
+              raise SystemExit('sha256sums array not found')
+          checksums = re.findall(r"['\"]([^'\"]+)['\"]", checksum_block.group(1))
+          if len(checksums) < 2:
+              raise SystemExit('expected Git SKIP and CEF checksums')
+
+          source_commits = re.findall(r'^\s*["\']karere::git\+[^"\']+#commit=([^"\']+)["\']$', pkgb, re.MULTILINE)
+          if source_commits != ['${_commit}']:
+              raise SystemExit('expected exactly one fixed Karere Git source using ${_commit}')
+
+          values = {
+              'pkgbase': srcinfo_assignment('pkgbase'),
+              'pkgname': assignment('pkgname'),
+              'pkgver': assignment('pkgver'),
+              'pkgrel': assignment('pkgrel'),
+              'commit': assignment('_commit'),
+              'cef_ver': assignment('_cef_ver'),
+              'cef_hash': assignment('_cef_hash'),
+              'cef_chromium': assignment('_cef_chromium'),
+              'cef_checksum': checksums[1],
+              'source_commit': assignment('_commit'),
+              'srcinfo_pkgname': srcinfo_assignment('pkgname'),
+              'srcinfo_pkgver': srcinfo_assignment('pkgver'),
+              'srcinfo_pkgrel': srcinfo_assignment('pkgrel'),
+              'srcinfo_provides': srcinfo_assignment('provides'),
+          }
+
+          with output_path.open('a') as output:
+              for key, value in values.items():
+                  if '\n' in value or '\r' in value:
+                      raise SystemExit(f'unexpected newline in AUR value {key}')
+                  output.write(f'{key}={value}\n')
+          PY
+
+          echo "Current AUR package: $(grep -m1 '^pkgver=' "$AUR_DIR/PKGBUILD")"
+
+      - name: Plan downstream and AUR state
+        id: plan
+        env:
+          CURRENT_AUR_PACKAGE: ${{ steps.aur_state.outputs.pkgname }}
+          CURRENT_AUR_BASE: ${{ steps.aur_state.outputs.pkgbase }}
+          CURRENT_AUR_VERSION: ${{ steps.aur_state.outputs.pkgver }}
+          CURRENT_AUR_REL: ${{ steps.aur_state.outputs.pkgrel }}
+          CURRENT_AUR_COMMIT: ${{ steps.aur_state.outputs.commit }}
+          CURRENT_AUR_SOURCE_COMMIT: ${{ steps.aur_state.outputs.source_commit }}
+          CURRENT_AUR_CEF_VER: ${{ steps.aur_state.outputs.cef_ver }}
+          CURRENT_AUR_CEF_HASH: ${{ steps.aur_state.outputs.cef_hash }}
+          CURRENT_AUR_CEF_CHROMIUM: ${{ steps.aur_state.outputs.cef_chromium }}
+          CURRENT_AUR_CEF_CHECKSUM: ${{ steps.aur_state.outputs.cef_checksum }}
+          CURRENT_SRCINFO_PACKAGE: ${{ steps.aur_state.outputs.srcinfo_pkgname }}
+          CURRENT_SRCINFO_VERSION: ${{ steps.aur_state.outputs.srcinfo_pkgver }}
+          CURRENT_SRCINFO_REL: ${{ steps.aur_state.outputs.srcinfo_pkgrel }}
+          CURRENT_SRCINFO_PROVIDES: ${{ steps.aur_state.outputs.srcinfo_provides }}
+          DESIRED_VERSION: ${{ steps.candidate.outputs.pkgver }}
+          PUBLISHED_DOWNSTREAM_SHA: ${{ steps.candidate.outputs.published_downstream_sha }}
+          DESIRED_CEF_VER: ${{ steps.cef_metadata.outputs.cef_ver }}
+          DESIRED_CEF_HASH: ${{ steps.cef_metadata.outputs.cef_hash }}
+          DESIRED_CEF_CHROMIUM: ${{ steps.cef_metadata.outputs.cef_chromium }}
+        run: |
+          set -Eeuo pipefail
+
+          [[ "$CURRENT_AUR_PACKAGE" == "$AUR_PACKAGE" ]] || {
+            echo "Unexpected AUR package name: $CURRENT_AUR_PACKAGE" >&2
+            exit 1
+          }
+          [[ "$CURRENT_AUR_BASE" == "$AUR_PACKAGE" ]] || {
+            echo "Unexpected AUR package base: $CURRENT_AUR_BASE" >&2
+            exit 1
+          }
+          [[ "$CURRENT_SRCINFO_PACKAGE" == "$AUR_PACKAGE" ]] || {
+            echo "Unexpected .SRCINFO package name: $CURRENT_SRCINFO_PACKAGE" >&2
+            exit 1
+          }
+          [[ "$CURRENT_AUR_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Unexpected current AUR pkgver: $CURRENT_AUR_VERSION" >&2
+            exit 1
+          }
+          [[ "$DESIRED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Unexpected desired pkgver: $DESIRED_VERSION" >&2
+            exit 1
+          }
+          [[ "$CURRENT_AUR_REL" =~ ^[0-9]+$ ]] || {
+            echo "Unexpected current AUR pkgrel: $CURRENT_AUR_REL" >&2
+            exit 1
+          }
+
+          version_order="$(python3 - "$CURRENT_AUR_VERSION" "$DESIRED_VERSION" <<'PY'
+          import sys
+          current = tuple(map(int, sys.argv[1].split('.')))
+          desired = tuple(map(int, sys.argv[2].split('.')))
+          print('lt' if current < desired else 'eq' if current == desired else 'gt')
+          PY
+          )"
+          if [[ "$version_order" == gt ]]; then
+            echo "Refusing to downgrade AUR ${CURRENT_AUR_VERSION} to ${DESIRED_VERSION}." >&2
+            exit 1
+          fi
+
+          aur_precheck_needs_update=false
+          desired_pkgrel="$CURRENT_AUR_REL"
+          if [[ "$version_order" == lt ]]; then
+            aur_precheck_needs_update=true
+            desired_pkgrel=1
+          else
+            if [[ "$CURRENT_AUR_COMMIT" != "$PUBLISHED_DOWNSTREAM_SHA" \
+              || "$CURRENT_AUR_SOURCE_COMMIT" != "$PUBLISHED_DOWNSTREAM_SHA" \
+              || "$CURRENT_AUR_CEF_VER" != "$DESIRED_CEF_VER" \
+              || "$CURRENT_AUR_CEF_HASH" != "$DESIRED_CEF_HASH" \
+              || "$CURRENT_AUR_CEF_CHROMIUM" != "$DESIRED_CEF_CHROMIUM" \
+              || "$CURRENT_SRCINFO_VERSION" != "$DESIRED_VERSION" \
+              || "$CURRENT_SRCINFO_REL" != "$CURRENT_AUR_REL" \
+              || "$CURRENT_SRCINFO_PROVIDES" != "karere=$DESIRED_VERSION" \
+              || ! "$CURRENT_AUR_CEF_CHECKSUM" =~ ^[0-9a-fA-F]{64}$ ]]; then
+              aur_precheck_needs_update=true
+              desired_pkgrel=$((CURRENT_AUR_REL + 1))
+            fi
+          fi
+
+          {
+            echo "aur_precheck_needs_update=$aur_precheck_needs_update"
+            echo "desired_pkgrel=$desired_pkgrel"
+            echo "current_aur_version=$CURRENT_AUR_VERSION"
+            echo "current_aur_rel=$CURRENT_AUR_REL"
+          } >> "$GITHUB_OUTPUT"
+          echo "AUR precheck needs update: ${aur_precheck_needs_update}."
+          echo "Desired AUR version: ${DESIRED_VERSION}-${desired_pkgrel}."
+
+      - name: Install native build dependencies
+        if: ${{ steps.candidate.outputs.branch_needs_update == 'true' || steps.candidate.outputs.tag_needs_update == 'true' || steps.plan.outputs.aur_precheck_needs_update == 'true' }}
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            blueprint-compiler \
+            build-essential \
+            ca-certificates \
+            cmake \
+            curl \
+            dbus-x11 \
+            gettext \
+            libadwaita-1-dev \
+            libasound2-dev \
+            libcairo2-dev \
+            libdrm-dev \
+            libegl1-mesa-dev \
+            libepoxy-dev \
+            libgdk-pixbuf-2.0-dev \
+            libgl1-mesa-dev \
+            libgles2-mesa-dev \
+            libglib2.0-dev \
+            libgraphene-1.0-dev \
+            libgtk-4-dev \
+            libnss3-dev \
+            libpango1.0-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcomposite-dev \
+            libxdamage-dev \
+            libxext-dev \
+            libxfixes-dev \
+            libxkbcommon-dev \
+            libxrandr-dev \
+            pkg-config \
+            python3 \
+            xvfb
+
+      - name: Install pinned Rust toolchain
+        if: ${{ steps.candidate.outputs.branch_needs_update == 'true' || steps.candidate.outputs.tag_needs_update == 'true' || steps.plan.outputs.aur_precheck_needs_update == 'true' }}
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: clippy
+
+      - name: Cache Cargo dependencies
+        if: ${{ steps.candidate.outputs.branch_needs_update == 'true' || steps.candidate.outputs.tag_needs_update == 'true' || steps.plan.outputs.aur_precheck_needs_update == 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ steps.candidate.outputs.candidate_sha }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Cache CEF runtime
+        if: ${{ steps.candidate.outputs.branch_needs_update == 'true' || steps.candidate.outputs.tag_needs_update == 'true' || steps.plan.outputs.aur_precheck_needs_update == 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: cef-binaries
+          key: ${{ runner.os }}-cef-${{ steps.cef_metadata.outputs.cef_ver }}-${{ steps.cef_metadata.outputs.cef_hash }}-${{ steps.cef_metadata.outputs.cef_chromium }}
+
+      - name: Download CEF runtime for candidate validation
+        if: ${{ steps.candidate.outputs.branch_needs_update == 'true' || steps.candidate.outputs.tag_needs_update == 'true' || steps.plan.outputs.aur_precheck_needs_update == 'true' }}
+        run: |
+          set -Eeuo pipefail
+          if [[ ! -f cef-binaries/current/Release/libcef.so ]]; then
+            ./download-cef.sh
+          fi
+          test -f cef-binaries/current/Release/libcef.so
+
+      - name: Check candidate
+        id: candidate_check
+        if: ${{ steps.candidate.outputs.branch_needs_update == 'true' || steps.candidate.outputs.tag_needs_update == 'true' || steps.plan.outputs.aur_precheck_needs_update == 'true' }}
+        env:
+          CEF_PATH: ${{ github.workspace }}/cef-binaries/current/Release
+        run: |
+          set -Eeuo pipefail
+          cargo check --locked --workspace --all-targets
+
+          # v4.2.5 has an upstream dead_code warning in the renderer dispatch
+          # trait. Keep other Clippy warnings fatal without an unrelated fix.
+          cargo clippy --locked --workspace --all-targets -- -D warnings -A dead_code
+
+          # Compile tests first so the CEF helper is present, then configure
+          # the native Chromium SUID sandbox exactly as the non-Flatpak build
+          # expects. GitHub-hosted runners allow this through sudo.
+          cargo test --locked --workspace --all-targets --no-run
+          test -f target/debug/chrome-sandbox
+          sudo chown root:root target/debug/chrome-sandbox
+          sudo chmod 4755 target/debug/chrome-sandbox
+
+          dbus-run-session -- xvfb-run -a env \
+            CEF_PATH="$CEF_PATH" \
+            cargo test --locked --workspace --all-targets -- --test-threads=1
+
+          cargo build --release --locked
+          echo 'validated=true' >> "$GITHUB_OUTPUT"
+
+      - name: Resolve and verify proprietary-codec CEF asset
+        id: cef_asset
+        if: ${{ steps.candidate.outputs.branch_needs_update == 'true' || steps.candidate.outputs.tag_needs_update == 'true' || steps.plan.outputs.aur_precheck_needs_update == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CEF_RELEASE_TAG: ${{ steps.cef_metadata.outputs.cef_release_tag }}
+          CEF_ASSET_NAME: ${{ steps.cef_metadata.outputs.cef_asset_name }}
+          CEF_MANIFEST_SHA256: ${{ steps.cef_metadata.outputs.cef_manifest_sha256 }}
+        run: |
+          set -Eeuo pipefail
+
+          release_json="$RUNNER_TEMP/cef-release.json"
+          release_url="https://api.github.com/repos/${UPSTREAM_REPOSITORY}/releases/tags/${CEF_RELEASE_TAG}"
+          curl --fail --silent --show-error --location --retry 3 \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "$release_url" > "$release_json"
+
+          asset_url="$(python3 - "$release_json" "$CEF_ASSET_NAME" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          release = json.loads(Path(sys.argv[1]).read_text())
+          name = sys.argv[2]
+          assets = [asset for asset in release.get('assets', []) if asset.get('name') == name]
+          if len(assets) != 1:
+              raise SystemExit(f'expected exactly one CEF asset named {name!r}, found {len(assets)}')
+          url = assets[0].get('browser_download_url', '')
+          if not url.startswith('https://github.com/tobagin/karere/releases/download/'):
+              raise SystemExit(f'unexpected CEF asset URL: {url}')
+          print(url)
+          PY
+          )"
+
+          asset_path="$RUNNER_TEMP/$CEF_ASSET_NAME"
+          curl --fail --silent --show-error --location --retry 3 \
+            --proto '=https' --tlsv1.2 \
+            -o "$asset_path" "$asset_url"
+          test -s "$asset_path"
+
+          checksum="$(sha256sum "$asset_path" | awk '{print $1}')"
+          [[ "$checksum" =~ ^[0-9a-fA-F]{64}$ ]]
+          [[ "$CEF_MANIFEST_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]
+          if [[ "${checksum,,}" != "${CEF_MANIFEST_SHA256,,}" ]]; then
+            echo '::error title=CEF checksum mismatch::Downloaded CEF asset does not match upstream Flatpak manifest.' >&2
+            echo "Expected: ${CEF_MANIFEST_SHA256}" >&2
+            echo "Actual:   ${checksum}" >&2
+            exit 1
+          fi
+
+          {
+            echo "asset_url=$asset_url"
+            echo "asset_path=$asset_path"
+            echo "sha256=$checksum"
+            echo "cef_download_sha256=$checksum"
+            echo 'cef_checksum_verified=true'
+          } >> "$GITHUB_OUTPUT"
+          echo "Verified CEF asset checksum against Flatpak manifest: ${checksum}."
+
+      - name: Determine final AUR state
+        id: aur_final
+        env:
+          PRECHECK_NEEDS_UPDATE: ${{ steps.plan.outputs.aur_precheck_needs_update }}
+          CURRENT_CEF_CHECKSUM: ${{ steps.aur_state.outputs.cef_checksum }}
+          RESOLVED_CEF_CHECKSUM: ${{ steps.cef_asset.outputs.sha256 }}
+          CEF_MANIFEST_SHA256: ${{ steps.cef_metadata.outputs.cef_manifest_sha256 }}
+          CEF_METADATA_VERIFIED: ${{ steps.cef_metadata.outputs.cef_metadata_verified }}
+          CEF_CHECKSUM_VERIFIED: ${{ steps.cef_asset.outputs.cef_checksum_verified }}
+        run: |
+          set -Eeuo pipefail
+
+          aur_needs_update=false
+          if [[ "$PRECHECK_NEEDS_UPDATE" == true ]]; then
+            [[ "$CEF_METADATA_VERIFIED" == true ]] || {
+              echo 'AUR update was required but CEF metadata was not cross-checked.' >&2
+              exit 1
+            }
+            [[ "$CEF_CHECKSUM_VERIFIED" == true ]] || {
+              echo 'AUR update was required but the downloaded CEF checksum was not verified.' >&2
+              exit 1
+            }
+            [[ "$RESOLVED_CEF_CHECKSUM" =~ ^[0-9a-fA-F]{64}$ ]] || {
+              echo 'AUR update was required but no verified CEF checksum is available.' >&2
+              exit 1
+            }
+            [[ "${RESOLVED_CEF_CHECKSUM,,}" == "${CEF_MANIFEST_SHA256,,}" ]] || {
+              echo 'Resolved CEF checksum differs from the verified Flatpak manifest checksum.' >&2
+              exit 1
+            }
+            if [[ "${CURRENT_CEF_CHECKSUM,,}" != "${RESOLVED_CEF_CHECKSUM,,}" ]]; then
+              aur_needs_update=true
+            else
+              # Other desired fields already triggered the precheck.
+              aur_needs_update=true
+            fi
+          fi
+
+          echo "aur_needs_update=$aur_needs_update" >> "$GITHUB_OUTPUT"
+          echo "AUR needs update: ${aur_needs_update}."
+
+      - name: Publish validated downstream branch and mirrored application tag
+        if: ${{ steps.candidate.outputs.branch_needs_update == 'true' || steps.candidate.outputs.tag_needs_update == 'true' }}
+        env:
+          BRANCH_NEEDS_UPDATE: ${{ steps.candidate.outputs.branch_needs_update }}
+          TAG_NEEDS_UPDATE: ${{ steps.candidate.outputs.tag_needs_update }}
+          CURRENT_BRANCH_SHA: ${{ steps.candidate.outputs.current_downstream_sha }}
+          LATEST_TAG: ${{ steps.candidate.outputs.latest_tag }}
+          CANDIDATE_VALIDATED: ${{ steps.candidate_check.outputs.validated }}
+          CEF_METADATA_VERIFIED: ${{ steps.cef_metadata.outputs.cef_metadata_verified }}
+          CEF_CHECKSUM_VERIFIED: ${{ steps.cef_asset.outputs.cef_checksum_verified }}
+          CEF_DOWNLOAD_SHA256: ${{ steps.cef_asset.outputs.cef_download_sha256 }}
+          CEF_MANIFEST_SHA256: ${{ steps.cef_metadata.outputs.cef_manifest_sha256 }}
+        run: |
+          set -Eeuo pipefail
+
+          [[ "$CANDIDATE_VALIDATED" == true ]] || {
+            echo 'Refusing publication: candidate validation did not complete successfully.' >&2
+            exit 1
+          }
+          [[ "$CEF_METADATA_VERIFIED" == true ]] || {
+            echo 'Refusing publication: CEF metadata was not cross-checked.' >&2
+            exit 1
+          }
+          [[ "$CEF_CHECKSUM_VERIFIED" == true ]] || {
+            echo 'Refusing publication: downloaded CEF checksum was not verified.' >&2
+            exit 1
+          }
+          [[ "${CEF_DOWNLOAD_SHA256,,}" == "${CEF_MANIFEST_SHA256,,}" ]] || {
+            echo 'Refusing publication: downloaded CEF checksum differs from the Flatpak manifest.' >&2
+            exit 1
+          }
+
+          if [[ "$BRANCH_NEEDS_UPDATE" == true && "$TAG_NEEDS_UPDATE" == true ]]; then
+            if [[ -n "$CURRENT_BRANCH_SHA" ]]; then
+              git push --atomic \
+                "--force-with-lease=refs/heads/${DOWNSTREAM_BRANCH}:${CURRENT_BRANCH_SHA}" \
+                origin \
+                "HEAD:refs/heads/${DOWNSTREAM_BRANCH}" \
+                "refs/tags/${LATEST_TAG}:refs/tags/${LATEST_TAG}"
+            else
+              git push --atomic origin \
+                "HEAD:refs/heads/${DOWNSTREAM_BRANCH}" \
+                "refs/tags/${LATEST_TAG}:refs/tags/${LATEST_TAG}"
+            fi
+          elif [[ "$BRANCH_NEEDS_UPDATE" == true ]]; then
+            if [[ -n "$CURRENT_BRANCH_SHA" ]]; then
+              git push \
+                "--force-with-lease=refs/heads/${DOWNSTREAM_BRANCH}:${CURRENT_BRANCH_SHA}" \
+                origin "HEAD:refs/heads/${DOWNSTREAM_BRANCH}"
+            else
+              git push origin "HEAD:refs/heads/${DOWNSTREAM_BRANCH}"
+            fi
+          elif [[ "$TAG_NEEDS_UPDATE" == true ]]; then
+            git push origin "refs/tags/${LATEST_TAG}:refs/tags/${LATEST_TAG}"
+          fi
+
+          echo "Validated GitHub downstream state published."
+
+      - name: Prepare and validate stable AUR package
+        id: aur_prepare
+        if: ${{ steps.aur_final.outputs.aur_needs_update == 'true' }}
+        env:
+          AUR_DIR: ${{ steps.aur_ssh.outputs.aur_dir }}
+          DESIRED_VERSION: ${{ steps.candidate.outputs.pkgver }}
+          DESIRED_PKGREL: ${{ steps.plan.outputs.desired_pkgrel }}
+          PUBLISHED_DOWNSTREAM_SHA: ${{ steps.candidate.outputs.published_downstream_sha }}
+          CEF_VER: ${{ steps.cef_metadata.outputs.cef_ver }}
+          CEF_HASH: ${{ steps.cef_metadata.outputs.cef_hash }}
+          CEF_CHROMIUM: ${{ steps.cef_metadata.outputs.cef_chromium }}
+          CEF_CHECKSUM: ${{ steps.cef_asset.outputs.sha256 }}
+          CANDIDATE_VALIDATED: ${{ steps.candidate_check.outputs.validated }}
+          CEF_METADATA_VERIFIED: ${{ steps.cef_metadata.outputs.cef_metadata_verified }}
+          CEF_CHECKSUM_VERIFIED: ${{ steps.cef_asset.outputs.cef_checksum_verified }}
+          CEF_MANIFEST_SHA256: ${{ steps.cef_metadata.outputs.cef_manifest_sha256 }}
+        run: |
+          set -Eeuo pipefail
+
+          [[ "$CANDIDATE_VALIDATED" == true ]]
+          [[ "$CEF_METADATA_VERIFIED" == true ]]
+          [[ "$CEF_CHECKSUM_VERIFIED" == true ]]
+          [[ "$CEF_CHECKSUM" =~ ^[0-9a-fA-F]{64}$ ]]
+          [[ "${CEF_CHECKSUM,,}" == "${CEF_MANIFEST_SHA256,,}" ]]
+          [[ "$DESIRED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$DESIRED_PKGREL" =~ ^[0-9]+$ ]]
+          [[ "$PUBLISHED_DOWNSTREAM_SHA" =~ ^[0-9a-fA-F]{40}$ ]]
+          [[ "$CEF_CHECKSUM" =~ ^[0-9a-fA-F]{64}$ ]]
+
+          python3 - "$AUR_DIR/PKGBUILD" "$DESIRED_VERSION" "$DESIRED_PKGREL" \
+            "$PUBLISHED_DOWNSTREAM_SHA" "$CEF_VER" "$CEF_HASH" "$CEF_CHROMIUM" "$CEF_CHECKSUM" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          version, pkgrel, commit, cef_ver, cef_hash, cef_chromium, cef_checksum = sys.argv[2:]
+          text = path.read_text()
+
+          if re.search(r'^pkgname=karere-custom-css-git$', text, re.MULTILINE):
+              raise SystemExit('refusing to modify the old -git package')
+          if '#branch=custom-css' in text or 'pkgver()' in text:
+              raise SystemExit('AUR PKGBUILD is not a fixed-release package')
+          if not re.search(r'^pkgname=karere-custom-css$', text, re.MULTILINE):
+              raise SystemExit('unexpected pkgname')
+          if not re.search(r'^\s*["\']karere::git\+[^"\']+#commit=\$\{_commit\}["\']$', text, re.MULTILINE):
+              raise SystemExit('expected fixed commit source transport')
+
+          def replace_once(text: str, pattern: str, replacement: str, label: str) -> str:
+              text, count = re.subn(pattern, replacement, text, count=1, flags=re.MULTILINE)
+              if count != 1:
+                  raise SystemExit(f'expected one {label} occurrence, found {count}')
+              return text
+
+          text = replace_once(text, r'^pkgver=.*$', f'pkgver={version}', 'pkgver')
+          text = replace_once(text, r'^pkgrel=.*$', f'pkgrel={pkgrel}', 'pkgrel')
+          text = replace_once(text, r'^_commit=.*$', f'_commit="{commit}"', '_commit')
+          text = replace_once(text, r'^_cef_ver=.*$', f'_cef_ver="{cef_ver}"', '_cef_ver')
+          text = replace_once(text, r'^_cef_hash=.*$', f'_cef_hash="{cef_hash}"', '_cef_hash')
+          text = replace_once(text, r'^_cef_chromium=.*$', f'_cef_chromium="{cef_chromium}"', '_cef_chromium')
+
+          checksum_pattern = r"(sha256sums=\(\s*['\"]SKIP['\"]\s+['\"])[0-9a-fA-F]{64}(['\"]\s*\))"
+          text, count = re.subn(checksum_pattern, rf'\g<1>{cef_checksum}\g<2>', text, count=1, flags=re.MULTILINE | re.DOTALL)
+          if count != 1:
+              raise SystemExit(f'expected one CEF checksum occurrence, found {count}')
+
+          path.write_text(text)
+          PY
+
+          # Generate .SRCINFO with the same Arch makepkg used for validation.
+          srcinfo_dir="$RUNNER_TEMP/aur-srcinfo"
+          rm -rf "$srcinfo_dir"
+          mkdir -p "$srcinfo_dir"
+          cp "$AUR_DIR/PKGBUILD" "$srcinfo_dir/PKGBUILD"
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp/arch-home \
+            --volume "$srcinfo_dir:/work" \
+            --workdir /work \
+            archlinux:base-devel \
+            bash -euc 'mkdir -p "$HOME"; makepkg --printsrcinfo > .SRCINFO'
+          cp "$srcinfo_dir/.SRCINFO" "$AUR_DIR/.SRCINFO"
+
+          grep -q '^pkgbase = karere-custom-css$' "$AUR_DIR/.SRCINFO"
+          grep -q $'^\tpkgver = '"$DESIRED_VERSION"'$' "$AUR_DIR/.SRCINFO"
+          grep -q $'^\tpkgrel = '"$DESIRED_PKGREL"'$' "$AUR_DIR/.SRCINFO"
+          grep -q '^pkgname = karere-custom-css$' "$AUR_DIR/.SRCINFO"
+          grep -q $'^\tprovides = karere='"$DESIRED_VERSION"'$' "$AUR_DIR/.SRCINFO"
+          grep -q $'^\tconflicts = karere-custom-css-git$' "$AUR_DIR/.SRCINFO"
+
+          git -C "$AUR_DIR" diff --check
+          changed="$(git -C "$AUR_DIR" status --short | awk '{print $2}')"
+          if [[ -n "$changed" ]] && grep -Evx '(PKGBUILD|\.SRCINFO)' <<< "$changed"; then
+            echo 'Unexpected tracked AUR files changed.' >&2
+            exit 1
+          fi
+
+          # Validate the actual AUR recipe before creating a commit that can be
+          # pushed. This parses the PKGBUILD, regenerates .SRCINFO, and fetches
+          # every source so makepkg verifies the declared SHA-256 checksum.
+          verify_dir="$RUNNER_TEMP/aur-verify"
+          rm -rf "$verify_dir"
+          mkdir -p "$verify_dir"
+          cp "$AUR_DIR/PKGBUILD" "$AUR_DIR/.SRCINFO" "$verify_dir/"
+          docker run --rm \
+            --env HOST_UID="$(id -u)" \
+            --volume "$verify_dir:/work" \
+            --workdir /work \
+            archlinux:base-devel \
+            bash -euc '
+              set -Eeuo pipefail
+              pacman -Sy --noconfirm --needed git >/dev/null
+              useradd --uid "$HOST_UID" --no-create-home --shell /bin/bash aur-builder
+              mkdir -p /tmp/arch-home
+              chown "$HOST_UID:$HOST_UID" /tmp/arch-home /work
+              runuser -u aur-builder -- env HOME=/tmp/arch-home makepkg --printsrcinfo > generated.SRCINFO
+              cmp --silent generated.SRCINFO .SRCINFO
+              runuser -u aur-builder -- env HOME=/tmp/arch-home makepkg --verifysource --noconfirm
+              # Extract sources and run prepare(), without requiring the full
+              # Arch dependency graph; the candidate build above covers Rust.
+              runuser -u aur-builder -- env HOME=/tmp/arch-home makepkg --nobuild --nodeps --noconfirm
+            '
+
+          git -C "$AUR_DIR" config user.name 'github-actions[bot]'
+          git -C "$AUR_DIR" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C "$AUR_DIR" add PKGBUILD .SRCINFO
+          git -C "$AUR_DIR" diff --cached --check
+          git -C "$AUR_DIR" commit -m "Update to Karere ${DESIRED_VERSION}"
+          echo 'AUR package prepared and validated.'
+          echo 'validated=true' >> "$GITHUB_OUTPUT"
+          echo 'prepared=true' >> "$GITHUB_OUTPUT"
+
+      - name: Publish validated stable AUR package
+        id: aur_publish
+        if: ${{ steps.aur_prepare.outputs.prepared == 'true' }}
+        env:
+          AUR_DIR: ${{ steps.aur_ssh.outputs.aur_dir }}
+          AUR_VALIDATED: ${{ steps.aur_prepare.outputs.validated }}
+          CEF_METADATA_VERIFIED: ${{ steps.cef_metadata.outputs.cef_metadata_verified }}
+          CEF_CHECKSUM_VERIFIED: ${{ steps.cef_asset.outputs.cef_checksum_verified }}
+        run: |
+          set -Eeuo pipefail
+
+          [[ "$AUR_VALIDATED" == true ]] || {
+            echo 'Refusing AUR publication: package validation did not complete successfully.' >&2
+            exit 1
+          }
+          [[ "$CEF_METADATA_VERIFIED" == true ]] || {
+            echo 'Refusing AUR publication: CEF metadata was not cross-checked.' >&2
+            exit 1
+          }
+          [[ "$CEF_CHECKSUM_VERIFIED" == true ]] || {
+            echo 'Refusing AUR publication: downloaded CEF checksum was not verified.' >&2
+            exit 1
+          }
+
+          git -C "$AUR_DIR" push origin master
+          echo 'AUR package published.'
+          echo 'result=published' >> "$GITHUB_OUTPUT"
+
+      - name: Write summary
+        if: always()
+        run: |
+          {
+            echo '## Custom CSS downstream sync'
+            echo
+            echo "- Upstream tag: ${{ steps.candidate.outputs.latest_tag }}"
+            echo "- Upstream commit: ${{ steps.candidate.outputs.upstream_sha }}"
+            echo "- Candidate commit: ${{ steps.candidate.outputs.candidate_sha }}"
+            echo "- Published downstream commit: ${{ steps.candidate.outputs.published_downstream_sha }}"
+            echo "- Branch update required: ${{ steps.candidate.outputs.branch_needs_update }}"
+            echo "- Fork tag update required: ${{ steps.candidate.outputs.tag_needs_update }}"
+            echo "- Required CEF: ${{ steps.cef_metadata.outputs.cef_ver }}+${{ steps.cef_metadata.outputs.cef_hash }}+chromium-${{ steps.cef_metadata.outputs.cef_chromium }}"
+            echo "- Flatpak CEF manifest SHA256: ${{ steps.cef_metadata.outputs.cef_manifest_sha256 }}"
+            echo "- CEF metadata cross-check: ${{ steps.cef_metadata.outputs.cef_metadata_verified }}"
+            echo "- Downloaded CEF SHA256: ${{ steps.cef_asset.outputs.cef_download_sha256 }}"
+            echo "- Downloaded CEF checksum verification: ${{ steps.cef_asset.outputs.cef_checksum_verified }}"
+            echo "- Candidate validation: ${{ steps.candidate_check.outputs.validated }}"
+            echo "- Current AUR version: ${{ steps.plan.outputs.current_aur_version }}-${{ steps.plan.outputs.current_aur_rel }}"
+            echo "- Desired AUR version: ${{ steps.candidate.outputs.pkgver }}-${{ steps.plan.outputs.desired_pkgrel }}"
+            echo "- AUR update required: ${{ steps.aur_final.outputs.aur_needs_update }}"
+            if [[ "${{ steps.aur_publish.outputs.result }}" == published ]]; then
+              echo '- AUR publication: published'
+            elif [[ "${{ steps.aur_final.outputs.aur_needs_update }}" == false ]]; then
+              echo '- AUR publication: already current'
+            else
+              echo '- AUR publication: not completed'
+            fi
+            echo '- Old karere-custom-css-git package: untouched'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove temporary AUR SSH key
+        if: always()
+        run: |
+          rm -f "${AUR_SSH_KEY:-}" "${AUR_SSH_KNOWN_HOSTS:-}"
