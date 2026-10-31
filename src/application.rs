@@ -143,6 +143,7 @@ mod imp {
     #[derive(Default)]
     pub struct KarereApplication {
         pub settings: OnceCell<gio::Settings>,
+        user_css: OnceCell<std::rc::Rc<crate::gtk_css::UserCss>>,
     }
 
     #[glib::object_subclass]
@@ -161,6 +162,10 @@ mod imp {
 
             crate::actions::register_app_actions(&app);
             register_accels(&app);
+
+            if let Some(user_css) = crate::gtk_css::UserCss::start() {
+                let _ = self.user_css.set(user_css);
+            }
 
             // Load the focus-indicator stylesheet once at APPLICATION priority
             // (user themes still win). Scoped under `.enhanced-focus`, which the
