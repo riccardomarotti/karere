@@ -14,6 +14,7 @@ mod cef_pump;
 mod cef_runtime;
 mod devtools;
 mod gl_dmabuf;
+mod gtk_css;
 mod handlers;
 mod i18n;
 mod ipc;
