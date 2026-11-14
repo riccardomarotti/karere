@@ -1,0 +1,269 @@
+name: Build Karere binary and sync AUR
+
+on:
+  schedule:
+    - cron: '47 7 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Optional stable upstream tag, e.g. v4.4.1'
+        required: false
+        type: string
+      pkgrel:
+        description: 'Package release; bump for rebuilding the same version'
+        required: false
+        type: string
+        default: '1'
+  push:
+    branches:
+      - main
+      - feature/karere-bin-aur
+    paths:
+      - '.github/workflows/karere-bin.yml'
+      - 'packaging/karere-bin/**'
+  pull_request:
+    paths:
+      - '.github/workflows/karere-bin.yml'
+      - 'packaging/karere-bin/**'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: karere-bin-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build native Arch artifact and, on main, publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Check out packaging workflow
+        uses: actions/checkout@v5
+
+      - name: Select a stable upstream release
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+          REQUESTED_PKGREL: ${{ inputs.pkgrel }}
+        run: |
+          set -Eeuo pipefail
+          pkgrel="$REQUESTED_PKGREL"
+          pkgrel="${pkgrel:-1}"
+          [[ "$pkgrel" =~ ^[1-9][0-9]*$ ]] || exit 1
+
+          tag="$REQUESTED_TAG"
+          if [[ -z "$tag" ]]; then
+            tag="$(git ls-remote --tags --refs https://github.com/tobagin/karere.git 'refs/tags/v*' |
+              awk '$2 ~ /^refs\/tags\/v[0-9]+\.[0-9]+\.[0-9]+$/ {sub("refs\\/tags\\/","",$2); print $2}' |
+              sort -V | tail -n 1)"
+          fi
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "No valid stable upstream tag: $tag" >&2
+            exit 1
+          }
+          version="${tag#v}"
+          work="$RUNNER_TEMP/karere-bin-work"
+          mkdir -p "$work/source" "$work/artifacts"
+          git -C "$work/source" init -q
+          git -C "$work/source" remote add upstream https://github.com/tobagin/karere.git
+          git -C "$work/source" fetch -q --depth=1 upstream "refs/tags/$tag"
+          git -C "$work/source" checkout -q --detach FETCH_HEAD
+          upstream_sha="$(git -C "$work/source" rev-parse HEAD)"
+          test -f "$work/source/Cargo.lock"
+
+          release_tag="karere-bin-v$version-$pkgrel"
+          asset="karere-$version-$pkgrel-linux-x86_64.tar.zst"
+          build=true
+          if [[ "$GITHUB_EVENT_NAME" != pull_request ]] &&
+             gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            build=false
+          fi
+          {
+            echo "version=$version"
+            echo "pkgrel=$pkgrel"
+            echo "upstream_tag=$tag"
+            echo "upstream_sha=$upstream_sha"
+            echo "release_tag=$release_tag"
+            echo "asset=$asset"
+            echo "build=$build"
+          } >> "$GITHUB_OUTPUT"
+          echo "Upstream $tag ($upstream_sha); build=$build."
+
+      - name: Build in an Arch Linux container
+        if: steps.meta.outputs.build == 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          PKGREL: ${{ steps.meta.outputs.pkgrel }}
+        run: |
+          set -Eeuo pipefail
+          docker run --rm --shm-size=2g \
+            --volume "$RUNNER_TEMP/karere-bin-work:/work" \
+            --volume "$GITHUB_WORKSPACE/packaging/karere-bin:/recipe:ro" \
+            --env "PKGVER=$VERSION" --env "PKGREL=$PKGREL" \
+            archlinux:base-devel bash /recipe/build-arch.sh
+
+      - name: Create an immutable GitHub binary release
+        if: github.ref == 'refs/heads/main' && steps.meta.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+          UPSTREAM_TAG: ${{ steps.meta.outputs.upstream_tag }}
+          UPSTREAM_SHA: ${{ steps.meta.outputs.upstream_sha }}
+        run: |
+          set -Eeuo pipefail
+          dir="$RUNNER_TEMP/karere-bin-work/artifacts"
+          (cd "$dir" && sha256sum -c "$ASSET.sha256")
+          gh release create "$RELEASE_TAG" "$dir/$ASSET" "$dir/$ASSET.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Karere $UPSTREAM_TAG - Arch Linux binary" \
+            --notes "Unmodified upstream Karere $UPSTREAM_TAG ($UPSTREAM_SHA) built on Arch Linux. Packaging recipe: packaging/karere-bin/. Not an official upstream binary." \
+            --target "$GITHUB_SHA" --latest=false
+
+      - name: Download a previously published binary release
+        if: steps.meta.outputs.build == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+        run: |
+          set -Eeuo pipefail
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$RUNNER_TEMP/karere-bin-work/artifacts" \
+            --pattern "$ASSET" \
+            --pattern "$ASSET.sha256"
+
+      - name: Verify the binary archive checksum
+        id: verify
+        env:
+          ASSET: ${{ steps.meta.outputs.asset }}
+        run: |
+          set -Eeuo pipefail
+          cd "$RUNNER_TEMP/karere-bin-work/artifacts"
+          sha256sum -c "$ASSET.sha256"
+          tar -tf "$ASSET" usr/bin/karere >/dev/null
+          sha="$(sha256sum "$ASSET" | awk '{print $1}')"
+          [[ "$sha" =~ ^[a-f0-9]{64}$ ]]
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Publish verified PKGBUILD to AUR
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          PKGREL: ${{ steps.meta.outputs.pkgrel }}
+          SHA256: ${{ steps.verify.outputs.sha256 }}
+        run: |
+          set -Eeuo pipefail
+          [[ -n "$AUR_SSH_PRIVATE_KEY" ]] || {
+            echo 'Missing repository secret AUR_SSH_PRIVATE_KEY' >&2
+            exit 1
+          }
+          [[ "$SHA256" =~ ^[a-f0-9]{64}$ && "$SHA256" != 0000000000000000000000000000000000000000000000000000000000000000 ]]
+
+          key="$RUNNER_TEMP/karere-bin-aur-key"
+          known="$RUNNER_TEMP/karere-bin-aur-known-hosts"
+          trap 'rm -f "$key" "$known"' EXIT
+          umask 077
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$key"
+          chmod 600 "$key"
+          ssh-keyscan -t ed25519 aur.archlinux.org 2>/dev/null > "$known"
+          fingerprint="$(ssh-keygen -lf "$known" -E sha256 | awk 'NR == 1 {print $2}')"
+          [[ "$fingerprint" == 'SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4' ]] || {
+            echo 'Unexpected AUR SSH host fingerprint' >&2
+            exit 1
+          }
+          export GIT_SSH_COMMAND="ssh -i $key -o UserKnownHostsFile=$known -o IdentitiesOnly=yes"
+          aur_dir="$RUNNER_TEMP/aur-karere-bin"
+          git clone -q ssh://aur@aur.archlinux.org/karere-bin.git "$aur_dir"
+          git -C "$aur_dir" symbolic-ref HEAD refs/heads/master
+
+          # Never replace an identical version/pkgrel with a different binary.
+          # A rebuilt artifact of the same upstream version needs a higher pkgrel.
+          if [[ -f "$aur_dir/PKGBUILD" ]]; then
+            oldver="$(sed -n 's/^pkgver=//p' "$aur_dir/PKGBUILD")"
+            oldrel="$(sed -n 's/^pkgrel=//p' "$aur_dir/PKGBUILD")"
+            state="$(python3 - "$oldver" "$oldrel" "$VERSION" "$PKGREL" <<'PY'
+          import sys
+          old = (tuple(map(int, sys.argv[1].split('.'))), int(sys.argv[2]))
+          new = (tuple(map(int, sys.argv[3].split('.'))), int(sys.argv[4]))
+          print('newer' if old > new else 'same' if old == new else 'older')
+          PY
+          )"
+            if [[ "$state" == newer ]]; then
+              echo 'AUR already has a newer version; refusing downgrade.'
+              exit 0
+            fi
+          else
+            state=older
+          fi
+
+          python3 - packaging/karere-bin/PKGBUILD "$aur_dir/PKGBUILD" "$VERSION" "$PKGREL" "$SHA256" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          source, output = map(Path, sys.argv[1:3])
+          version, rel, checksum = sys.argv[3:]
+          content = source.read_text()
+          updates = [
+              (r"^pkgver=[0-9]+\.[0-9]+\.[0-9]+$", f"pkgver={version}"),
+              (r"^pkgrel=[0-9]+$", f"pkgrel={rel}"),
+              (r"^sha256sums=\('[0-9a-f]{64}'\)$", f"sha256sums=('{checksum}')"),
+          ]
+          for pattern, replacement in updates:
+              content, n = re.subn(pattern, replacement, content, flags=re.MULTILINE)
+              if n != 1:
+                  raise SystemExit(f"expected exactly one match for {pattern}")
+          if "0000000000000000000000000000000000000000000000000000000000000000" in content:
+              raise SystemExit("refusing to publish a placeholder checksum")
+          output.write_text(content)
+          PY
+
+          # Generate real .SRCINFO and verify the downloaded GitHub release
+          # against the SHA256 declared in the actual PKGBUILD.
+          docker run --rm \
+            --env "HOST_UID=$(id -u)" \
+            --volume "$aur_dir:/pkg" --workdir /pkg \
+            archlinux:base-devel bash -euc '
+              # Avoid a partial upgrade: the Arch container may have a stale package database.
+              pacman -Syu --noconfirm --needed curl >/dev/null
+              useradd --uid "$HOST_UID" --create-home aur-builder
+              chown "$HOST_UID:$HOST_UID" /pkg
+              runuser -u aur-builder -- makepkg --printsrcinfo > .SRCINFO
+              chown "$HOST_UID:$HOST_UID" .SRCINFO
+              runuser -u aur-builder -- makepkg --verifysource --noconfirm
+            '
+          grep -q '^pkgbase = karere-bin$' "$aur_dir/.SRCINFO"
+          grep -q '^pkgname = karere-bin$' "$aur_dir/.SRCINFO"
+          git -C "$aur_dir" add PKGBUILD .SRCINFO
+          if git -C "$aur_dir" diff --cached --quiet; then
+            echo 'AUR package is already current.'
+            exit 0
+          fi
+          if [[ "$state" == same ]]; then
+            echo 'Refusing to change package content without bumping pkgrel' >&2
+            exit 1
+          fi
+          git -C "$aur_dir" diff --cached --check
+          git -C "$aur_dir" config user.name 'github-actions[bot]'
+          git -C "$aur_dir" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C "$aur_dir" commit -m "Update to Karere $VERSION-$PKGREL"
+          git -C "$aur_dir" push origin HEAD:master
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '## Karere binary'
+            echo
+            echo "- Upstream: ${{ steps.meta.outputs.upstream_tag }}"
+            echo "- Upstream commit: ${{ steps.meta.outputs.upstream_sha }}"
+            echo "- Binary release: ${{ steps.meta.outputs.release_tag }}"
+            echo "- SHA256 verified: ${{ steps.verify.outputs.sha256 }}"
+            echo "- AUR publication attempted: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}"
+          } >> "$GITHUB_STEP_SUMMARY"
