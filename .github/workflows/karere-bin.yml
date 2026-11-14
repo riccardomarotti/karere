@@ -230,7 +230,8 @@ jobs:
             --env "HOST_UID=$(id -u)" \
             --volume "$aur_dir:/pkg" --workdir /pkg \
             archlinux:base-devel bash -euc '
-              pacman -Sy --noconfirm --needed curl >/dev/null
+              # Avoid a partial upgrade: the Arch container may have a stale package database.
+              pacman -Syu --noconfirm --needed curl >/dev/null
               useradd --uid "$HOST_UID" --create-home aur-builder
               chown "$HOST_UID:$HOST_UID" /pkg
               runuser -u aur-builder -- makepkg --printsrcinfo > .SRCINFO
