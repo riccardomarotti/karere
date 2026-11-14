@@ -93,5 +93,5 @@ asset="karere-$PKGVER-$PKGREL-linux-x86_64.tar.zst"
 tar -C "$stage" -cf - usr | zstd -T2 -6 -o "$out/$asset"
 (cd "$out" && sha256sum "$asset" > "$asset.sha256")
 (cd "$out" && sha256sum -c "$asset.sha256")
-tar -tf "$out/$asset" | grep -qx 'usr/bin/karere'
+tar -tf "$out/$asset" usr/bin/karere >/dev/null
 echo "Built $out/$asset"

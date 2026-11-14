@@ -14,6 +14,13 @@ on:
         required: false
         type: string
         default: '1'
+  push:
+    branches:
+      - main
+      - feature/karere-bin-aur
+    paths:
+      - '.github/workflows/karere-bin.yml'
+      - 'packaging/karere-bin/**'
   pull_request:
     paths:
       - '.github/workflows/karere-bin.yml'
@@ -99,7 +106,7 @@ jobs:
             archlinux:base-devel bash /recipe/build-arch.sh
 
       - name: Create an immutable GitHub binary release
-        if: github.event_name != 'pull_request' && steps.meta.outputs.build == 'true'
+        if: github.ref == 'refs/heads/main' && steps.meta.outputs.build == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
@@ -138,7 +145,7 @@ jobs:
           set -Eeuo pipefail
           cd "$RUNNER_TEMP/karere-bin-work/artifacts"
           sha256sum -c "$ASSET.sha256"
-          tar -tf "$ASSET" | grep -qx 'usr/bin/karere'
+          tar -tf "$ASSET" usr/bin/karere >/dev/null
           sha="$(sha256sum "$ASSET" | awk '{print $1}')"
           [[ "$sha" =~ ^[a-f0-9]{64}$ ]]
           echo "sha256=$sha" >> "$GITHUB_OUTPUT"
